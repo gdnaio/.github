@@ -1,0 +1,23 @@
+name: CI Maintenance Sweep
+
+# Weekly agentic maintenance: flags GitHub Action majors that have fallen behind
+# latest (Node-runtime deprecation early-warning). Calls the org reusable workflow.
+# Pair this with a .github/dependabot.yml (github-actions ecosystem) which opens
+# the actual version-bump PRs.
+
+on:
+  schedule:
+    - cron: "0 13 * * 1" # Mondays 13:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  sweep:
+    uses: gdnaio/.github/.github/workflows/dependabot-sweep.yml@main
+    with:
+      # Optional Slack reporting — set both to enable, leave blank to skip.
+      slack_channel: ""
+      aws_role_arn: ""

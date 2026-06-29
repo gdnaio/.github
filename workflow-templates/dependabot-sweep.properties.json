@@ -1,0 +1,6 @@
+{
+  "name": "CI Maintenance Sweep (action-version drift)",
+  "description": "Weekly reusable sweep that flags GitHub Action majors behind latest. Pairs with Dependabot for the actual bump PRs.",
+  "iconName": "octicon-dependabot",
+  "categories": ["Continuous integration"]
+}

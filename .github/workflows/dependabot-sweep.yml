@@ -1,0 +1,126 @@
+name: Dependabot Action-Version Sweep (reusable)
+
+# Org-wide reusable workflow. Scans the CALLER repo's .github/workflows for
+# GitHub Action major versions that have fallen behind their latest release —
+# the usual cause of "Node.js NN is deprecated" runner warnings and eventual
+# hard failures. Pairs with each repo's .github/dependabot.yml (which opens the
+# actual bump PRs); this sweep is the visibility layer so drift is never silent.
+#
+# Read-only: never edits code, never deploys. Slack reporting is optional and
+# only runs when the caller passes aws_role_arn + slack_channel.
+#
+# Usage (caller repo):
+#   jobs:
+#     sweep:
+#       uses: gdnaio/.github/.github/workflows/dependabot-sweep.yml@main
+#       permissions:
+#         contents: read
+#         id-token: write
+#       with:
+#         slack_channel: int-ai-gdnainternal-aeos-chat-dev-ops
+#         aws_role_arn: arn:aws:iam::ACCOUNT_ID:role/your-oidc-role
+
+on:
+  workflow_call:
+    inputs:
+      slack_channel:
+        description: Public Slack channel name to report to (blank = no Slack).
+        type: string
+        required: false
+        default: ""
+      aws_role_arn:
+        description: OIDC role ARN that can read slack_bot_token (blank = no Slack).
+        type: string
+        required: false
+        default: ""
+      aws_region:
+        type: string
+        required: false
+        default: us-east-1
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Sweep action versions
+        id: sweep
+        run: |
+          set -uo pipefail
+          WF_DIR=.github/workflows
+          drift=0
+          report=""
+          pins=$(grep -rhoE 'uses:[[:space:]]*[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@v[0-9]+' "$WF_DIR" 2>/dev/null \
+            | sed -E 's/.*uses:[[:space:]]*//' | sort -u)
+          if [ -z "$pins" ]; then echo "No pinned actions found"; echo "CI_MAINT_DRIFT=0" >> "$GITHUB_ENV"; exit 0; fi
+          while IFS= read -r pin; do
+            pin=$(echo "$pin" | tr -d '[:space:]'); [ -z "$pin" ] && continue
+            repo="${pin%@*}"; cur="${pin#*@v}"
+            latest_tag=$(gh release view --repo "$repo" --json tagName --jq '.tagName' 2>/dev/null || true)
+            if [ -z "$latest_tag" ]; then report+="\u2022 ${pin} \u2014 latest unknown (skipped)\n"; continue; fi
+            latest_major=$(echo "$latest_tag" | sed -E 's/^v?([0-9]+).*/\1/')
+            if [ -n "$latest_major" ] && [ "$cur" -lt "$latest_major" ] 2>/dev/null; then
+              report+="\u2022 ${repo}: pinned @v${cur} \u2192 latest ${latest_tag} (BEHIND)\n"; drift=1
+            else
+              report+="\u2022 ${repo}: @v${cur} (current)\n"
+            fi
+          done <<< "$pins"
+          echo -e "Action-version sweep:\n$report"
+          echo "CI_MAINT_DRIFT=$drift" >> "$GITHUB_ENV"
+          printf 'CI_MAINT_REPORT<<EOF\n%b\nEOF\n' "$report" >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials (OIDC)
+        if: ${{ always() && inputs.aws_role_arn != '' && inputs.slack_channel != '' }}
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-region: ${{ inputs.aws_region }}
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          role-session-name: gha-dependabot-sweep
+
+      - name: Report to Slack
+        if: ${{ always() && inputs.aws_role_arn != '' && inputs.slack_channel != '' }}
+        env:
+          SLACK_CHANNEL: ${{ inputs.slack_channel }}
+          AWS_REGION: ${{ inputs.aws_region }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          TOKEN=$(aws secretsmanager get-secret-value --region "$AWS_REGION" \
+            --secret-id slack_bot_token --query SecretString --output text 2>/dev/null \
+            | python3 -c "import sys,json;print(json.load(sys.stdin).get('slack_bot_token',''))" || true)
+          if [ -z "$TOKEN" ]; then echo "no slack_bot_token; skipping"; exit 0; fi
+          python3 - <<PY
+          import json, os, urllib.request
+          tok = "$TOKEN"
+          drift = os.environ.get("CI_MAINT_DRIFT", "0") == "1"
+          report = os.environ.get("CI_MAINT_REPORT", "(no report)")
+          icon = "\u26a0\ufe0f" if drift else "\u2705"
+          head = (f"*{os.environ['REPO']} CI maintenance \u2014 action versions BEHIND*" if drift
+                  else f"*{os.environ['REPO']} CI maintenance \u2014 all action versions current*")
+          text = (f"{icon} {head}\n{report}\n<{os.environ['RUN_URL']}|sweep run>"
+                  + ("\nDependabot will open bump PRs; review + merge." if drift else ""))
+          def api(method, payload=None):
+              url = f"https://slack.com/api/{method}"
+              data = json.dumps(payload).encode() if payload else None
+              req = urllib.request.Request(url, data=data,
+                  headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json; charset=utf-8"})
+              return json.loads(urllib.request.urlopen(req, timeout=10).read())
+          try:
+              lst = api("conversations.list?types=public_channel&limit=1000")
+              cid = next((c["id"] for c in lst.get("channels", []) if c["name"] == os.environ["SLACK_CHANNEL"]), "")
+              if cid:
+                  try: api("conversations.join", {"channel": cid})
+                  except Exception: pass
+                  r = api("chat.postMessage", {"channel": cid, "text": text})
+                  print("slack ok" if r.get("ok") else f"slack error: {r.get('error')}")
+              else:
+                  print("channel not found; skipping")
+          except Exception as e:
+              print(f"slack post failed (non-blocking): {e}")
+          PY

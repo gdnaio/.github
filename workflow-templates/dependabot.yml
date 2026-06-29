@@ -1,0 +1,20 @@
+# Reference Dependabot config — copy to .github/dependabot.yml in any repo.
+# Keeps GitHub Action versions current automatically (the durable fix for
+# Node-runtime deprecation warnings). Add other ecosystems (npm, pip) as needed.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    labels:
+      - "ci"
+      - "maintenance"
